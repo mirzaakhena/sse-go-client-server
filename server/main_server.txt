@@ -1,0 +1,320 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"shared/utility"
+	"strconv"
+	"time"
+)
+
+// RequestPayload struktur untuk payload yang dikirim ke client
+type RequestPayload struct {
+	Count int `json:"count"`
+}
+
+// GreetingPayload struktur untuk payload greeting yang dikirim ke client
+type GreetingPayload struct {
+	Name string `json:"name"`
+}
+
+// ProcessResult struktur untuk menyimpan hasil proses dari client
+type ProcessResult struct {
+	ClientID string  `json:"client_id"`
+	Values   []int64 `json:"values"`
+}
+
+// GreetingResult struktur untuk menyimpan hasil greeting dari client
+type GreetingResult struct {
+	ClientID string `json:"client_id"`
+	Message  string `json:"message"`
+}
+
+// APIResponse adalah struktur respons API standar
+type APIResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
+}
+
+// Inisialisasi SSE server global
+var sseServer *utility.SSEServer
+
+func main() {
+	// Konfigurasi SSE
+	sseConfig := utility.SSEConfig{
+		MaxConnections: 1000,
+		KeepAlive:      15 * time.Second,
+		Origins:        []string{"*"}, // Untuk development, bisa lebih spesifik untuk production
+	}
+
+	// Inisialisasi SSE server
+	sseServer = utility.NewSSEServer(sseConfig)
+
+	// Rute API untuk client
+	http.HandleFunc("/api/sse/connect", sseServer.HandleSSE)
+	http.HandleFunc("/api/trigger-request", handleTriggerRequest)
+	http.HandleFunc("/api/greeting", handleGreeting)
+	http.HandleFunc("/api/collect-result", handleCollectResult)
+
+	// Rute API untuk manajemen
+	http.HandleFunc("/api/clients", handleGetClients)
+
+	// Default route
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "Server is running")
+	})
+
+	port := 8080
+	fmt.Printf("Server started at http://localhost:%d\n", port)
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
+
+	// TODO: Implement HTTPS support
+	// Generate self-signed certificate:
+	// openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+	// Then use:
+	// log.Fatal(http.ListenAndServeTLS(fmt.Sprintf(":%d", port), "cert.pem", "key.pem", nil))
+}
+
+// sendJSONResponse mengirim respons JSON standard
+func sendJSONResponse(w http.ResponseWriter, status int, resp APIResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleGetClients menampilkan daftar client yang terhubung
+func handleGetClients(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		sendJSONResponse(w, http.StatusMethodNotAllowed, APIResponse{
+			Status:  "error",
+			Message: "Method not allowed",
+		})
+		return
+	}
+
+	// Mendapatkan daftar client yang terhubung
+	clientIDs := sseServer.GetConnectedClientIDs()
+	clientCount := sseServer.GetConnectedClientCount()
+
+	sendJSONResponse(w, http.StatusOK, APIResponse{
+		Status:  "success",
+		Message: fmt.Sprintf("%d clients connected", clientCount),
+		Data: map[string]any{
+			"count":      clientCount,
+			"client_ids": clientIDs,
+		},
+	})
+}
+
+// handleTriggerRequest menangani permintaan untuk trigger request ke client
+func handleTriggerRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		sendJSONResponse(w, http.StatusMethodNotAllowed, APIResponse{
+			Status:  "error",
+			Message: "Method not allowed",
+		})
+		return
+	}
+
+	// Parse parameter count dari query string
+	countStr := r.URL.Query().Get("count")
+	if countStr == "" {
+		countStr = "1" // Default value
+	}
+
+	count, err := strconv.Atoi(countStr)
+	if err != nil || count < 1 {
+		sendJSONResponse(w, http.StatusBadRequest, APIResponse{
+			Status:  "error",
+			Message: "Invalid count parameter",
+		})
+		return
+	}
+
+	// Parse clientID dari query string
+	clientID := r.URL.Query().Get("client_id")
+	if clientID == "" {
+		sendJSONResponse(w, http.StatusBadRequest, APIResponse{
+			Status:  "error",
+			Message: "Missing client_id parameter",
+		})
+		return
+	}
+
+	// Periksa apakah client terhubung
+	if !sseServer.IsClientConnected(clientID) {
+		sendJSONResponse(w, http.StatusBadRequest, APIResponse{
+			Status:  "error",
+			Message: fmt.Sprintf("Client %s not connected", clientID),
+		})
+		return
+	}
+
+	// Buat payload untuk dikirim ke client
+	payload := RequestPayload{
+		Count: count,
+	}
+
+	// Buat message untuk SSE
+	message := utility.Message{
+		EventType: "request",
+		Data:      payload,
+	}
+
+	// Kirim message ke client spesifik
+	ctx := context.Background()
+	err = sseServer.SendToClient(ctx, clientID, message)
+	if err != nil {
+		sendJSONResponse(w, http.StatusInternalServerError, APIResponse{
+			Status:  "error",
+			Message: fmt.Sprintf("Error sending message: %v", err),
+		})
+		return
+	}
+
+	// Kirim response sukses
+	sendJSONResponse(w, http.StatusOK, APIResponse{
+		Status:  "success",
+		Message: fmt.Sprintf("Request sent to client %s with count %d", clientID, count),
+	})
+}
+
+// handleGreeting menangani permintaan greeting ke client
+func handleGreeting(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		sendJSONResponse(w, http.StatusMethodNotAllowed, APIResponse{
+			Status:  "error",
+			Message: "Method not allowed",
+		})
+		return
+	}
+
+	// Parse parameter name dari query string
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		sendJSONResponse(w, http.StatusBadRequest, APIResponse{
+			Status:  "error",
+			Message: "Missing name parameter",
+		})
+		return
+	}
+
+	// Parse clientID dari query string
+	clientID := r.URL.Query().Get("client_id")
+	if clientID == "" {
+		sendJSONResponse(w, http.StatusBadRequest, APIResponse{
+			Status:  "error",
+			Message: "Missing client_id parameter",
+		})
+		return
+	}
+
+	// Periksa apakah client terhubung
+	if !sseServer.IsClientConnected(clientID) {
+		sendJSONResponse(w, http.StatusBadRequest, APIResponse{
+			Status:  "error",
+			Message: fmt.Sprintf("Client %s not connected", clientID),
+		})
+		return
+	}
+
+	// Buat payload untuk dikirim ke client
+	payload := GreetingPayload{
+		Name: name,
+	}
+
+	// Buat message untuk SSE
+	message := utility.Message{
+		EventType: "greeting",
+		Data:      payload,
+	}
+
+	// Kirim message ke client spesifik
+	ctx := context.Background()
+	err := sseServer.SendToClient(ctx, clientID, message)
+	if err != nil {
+		sendJSONResponse(w, http.StatusInternalServerError, APIResponse{
+			Status:  "error",
+			Message: fmt.Sprintf("Error sending message: %v", err),
+		})
+		return
+	}
+
+	// Kirim response sukses
+	sendJSONResponse(w, http.StatusOK, APIResponse{
+		Status:  "success",
+		Message: fmt.Sprintf("Greeting request sent to client %s with name %s", clientID, name),
+	})
+}
+
+// handleCollectResult menangani penerimaan hasil dari client
+func handleCollectResult(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		sendJSONResponse(w, http.StatusMethodNotAllowed, APIResponse{
+			Status:  "error",
+			Message: "Method not allowed",
+		})
+		return
+	}
+
+	// Periksa tipe result dari query parameter
+	resultType := r.URL.Query().Get("type")
+	if resultType == "" {
+		resultType = "process" // Default ke process result
+	}
+
+	var responseData any
+	var responseMsg string
+
+	switch resultType {
+	case "process":
+		// Decode body request untuk process result
+		var result ProcessResult
+		if err := json.NewDecoder(r.Body).Decode(&result); err != nil {
+			sendJSONResponse(w, http.StatusBadRequest, APIResponse{
+				Status:  "error",
+				Message: "Invalid request body",
+			})
+			return
+		}
+
+		// Log hasil yang diterima
+		log.Printf("Received process result from client %s: %v", result.ClientID, result.Values)
+		responseData = result
+		responseMsg = "Process result received successfully"
+
+	case "greeting":
+		// Decode body request untuk greeting result
+		var result GreetingResult
+		if err := json.NewDecoder(r.Body).Decode(&result); err != nil {
+			sendJSONResponse(w, http.StatusBadRequest, APIResponse{
+				Status:  "error",
+				Message: "Invalid request body",
+			})
+			return
+		}
+
+		// Log hasil yang diterima
+		log.Printf("Received greeting result from client %s: %s", result.ClientID, result.Message)
+		responseData = result
+		responseMsg = "Greeting result received successfully"
+
+	default:
+		sendJSONResponse(w, http.StatusBadRequest, APIResponse{
+			Status:  "error",
+			Message: "Unknown result type",
+		})
+		return
+	}
+
+	// Kirim respons sukses
+	sendJSONResponse(w, http.StatusOK, APIResponse{
+		Status:  "success",
+		Message: responseMsg,
+		Data:    responseData,
+	})
+}

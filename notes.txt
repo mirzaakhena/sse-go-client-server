@@ -1,0 +1,11 @@
+Create Code Skeleton
+
+
+
+
+Agent bisa :
+  Scan network dengan ICMP
+  Scan network dengan SNMP (Mac Address, IP Adresss, NIC Vendor)
+  Get All OID's
+  Reboot Moxa Device
+  Monitoring traffic Realtime

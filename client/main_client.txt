@@ -1,0 +1,275 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"log"
+	"math/rand"
+	"net/http"
+	"os"
+	"shared/utility"
+	"time"
+)
+
+// Config berisi konfigurasi client
+type Config struct {
+	ServerURL string `json:"server_url"`
+	ClientID  string `json:"client_id,omitempty"` // Optional client ID, akan dibuat oleh server jika kosong
+}
+
+// RequestPayload struktur untuk payload yang diterima dari server
+type RequestPayload struct {
+	Count int `json:"count"`
+}
+
+// GreetingPayload struktur untuk payload greeting yang diterima dari server
+type GreetingPayload struct {
+	Name string `json:"name"`
+}
+
+// ProcessResult struktur untuk hasil proses yang dikirim ke server
+type ProcessResult struct {
+	ClientID string  `json:"client_id"`
+	Values   []int64 `json:"values"`
+}
+
+// GreetingResult struktur untuk hasil greeting yang dikirim ke server
+type GreetingResult struct {
+	ClientID string `json:"client_id"`
+	Message  string `json:"message"`
+}
+
+var config Config
+var sseClient *utility.SSEClient
+
+func main() {
+	// Load konfigurasi
+	loadConfig()
+
+	// Inisialisasi SSE client
+	sseClient = utility.NewSSEClient(utility.SSEClientConfig{
+		ServerURL: config.ServerURL,
+		ClientID:  config.ClientID,
+	})
+
+	// Daftarkan handler untuk berbagai event
+	registerEventHandlers()
+
+	// Mulai koneksi
+	if err := sseClient.Connect(); err != nil {
+		log.Fatalf("Gagal terhubung ke server: %v", err)
+	}
+
+	// Menunggu input dari user untuk keluar
+	fmt.Println("Client is running. Press Enter to exit.")
+	bufio.NewReader(os.Stdin).ReadBytes('\n')
+
+	// Close SSE client
+	sseClient.Close()
+	fmt.Println("Client shutting down...")
+}
+
+// loadConfig memuat konfigurasi dari file atau environment
+func loadConfig() {
+	// Default config
+	config.ServerURL = "http://localhost:8080"
+
+	// Baca dari environment variable jika ada
+	if serverURL := os.Getenv("SERVER_URL"); serverURL != "" {
+		config.ServerURL = serverURL
+	}
+
+	// Baca client ID dari environment jika ada
+	if cID := os.Getenv("CLIENT_ID"); cID != "" {
+		config.ClientID = cID
+	}
+
+	fmt.Printf("Using server URL: %s\n", config.ServerURL)
+	if config.ClientID != "" {
+		fmt.Printf("Using client ID: %s\n", config.ClientID)
+	}
+}
+
+// registerEventHandlers mendaftarkan semua handler event untuk SSE
+func registerEventHandlers() {
+	// Handler untuk event "request"
+	sseClient.AddEventHandler("request", func(data []byte) error {
+		var payload RequestPayload
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return fmt.Errorf("error parsing request payload: %v", err)
+		}
+
+		fmt.Printf("Received request with count: %d\n", payload.Count)
+
+		// Process request dalam goroutine
+		go processRequest(payload)
+		return nil
+	})
+
+	// Handler untuk event "greeting"
+	sseClient.AddEventHandler("greeting", func(data []byte) error {
+		var payload GreetingPayload
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return fmt.Errorf("error parsing greeting payload: %v", err)
+		}
+
+		fmt.Printf("Received greeting request with name: %s\n", payload.Name)
+
+		// Process greeting dalam goroutine
+		go processGreeting(payload)
+		return nil
+	})
+}
+
+// processRequest memproses request dari server
+func processRequest(payload RequestPayload) {
+	fmt.Printf("Processing request with count: %d\n", payload.Count)
+	fmt.Println("Processing will take 5 seconds...")
+
+	// Simulasi proses yang memakan waktu
+	time.Sleep(5 * time.Second)
+
+	// Generate random values sebanyak count
+	values := make([]int64, payload.Count)
+	for i := 0; i < payload.Count; i++ {
+		values[i] = rand.Int63n(1000)
+	}
+
+	// Buat result
+	result := ProcessResult{
+		ClientID: sseClient.GetClientID(),
+		Values:   values,
+	}
+
+	// Kirim result ke server dengan retry
+	retryWithBackoff(3, func() error {
+		return sendResultToServer(result)
+	})
+}
+
+// processGreeting memproses request greeting dari server
+func processGreeting(payload GreetingPayload) {
+	fmt.Printf("Processing greeting for name: %s\n", payload.Name)
+	fmt.Println("Processing will take 3 seconds...")
+
+	// Simulasi proses yang memakan waktu
+	time.Sleep(3 * time.Second)
+
+	// Buat greeting message
+	message := fmt.Sprintf("Hello %s", payload.Name)
+
+	// Buat result
+	result := GreetingResult{
+		ClientID: sseClient.GetClientID(),
+		Message:  message,
+	}
+
+	// Kirim result ke server dengan retry
+	retryWithBackoff(3, func() error {
+		return sendGreetingResultToServer(result)
+	})
+}
+
+// retryWithBackoff mencoba ulang fungsi dengan backoff eksponensial
+func retryWithBackoff(maxRetries int, fn func() error) {
+	retryCount := 0
+	backoff := 1 * time.Second
+
+	for {
+		err := fn()
+		if err == nil {
+			return
+		}
+
+		retryCount++
+		if retryCount > maxRetries {
+			log.Printf("Max retries reached (%d). Giving up.", maxRetries)
+			return
+		}
+
+		// Jika koneksi terputus, log status
+		if !sseClient.IsConnected() {
+			log.Printf("Connection lost. Attempting to reconnect...")
+		}
+
+		log.Printf("Error: %v. Retrying in %v (attempt %d/%d)...",
+			err, backoff, retryCount, maxRetries)
+		time.Sleep(backoff)
+
+		// Increase backoff for next attempt, with a maximum of 1 minute
+		backoff *= 2
+		if backoff > 1*time.Minute {
+			backoff = 1 * time.Minute
+		}
+	}
+}
+
+// sendResultToServer mengirim hasil proses ke server
+func sendResultToServer(result ProcessResult) error {
+	// Periksa status koneksi
+	if !sseClient.IsConnected() {
+		return fmt.Errorf("not connected to server, cannot send result")
+	}
+
+	url := fmt.Sprintf("%s/api/collect-result?type=process", config.ServerURL)
+
+	// Marshal result ke JSON
+	jsonData, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("error marshaling result: %v", err)
+	}
+
+	// Kirim POST request ke server
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("error sending result to server: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Cek respons
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned non-OK status: %d", resp.StatusCode)
+	}
+
+	fmt.Println("Process result sent to server successfully")
+
+	// Log values yang dikirim
+	fmt.Printf("Sent values: %v\n", result.Values)
+	return nil
+}
+
+// sendGreetingResultToServer mengirim hasil greeting ke server
+func sendGreetingResultToServer(result GreetingResult) error {
+	// Periksa status koneksi
+	if !sseClient.IsConnected() {
+		return fmt.Errorf("not connected to server, cannot send greeting result")
+	}
+
+	url := fmt.Sprintf("%s/api/collect-result?type=greeting", config.ServerURL)
+
+	// Marshal result ke JSON
+	jsonData, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("error marshaling greeting result: %v", err)
+	}
+
+	// Kirim POST request ke server
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("error sending greeting result to server: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Cek respons
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned non-OK status: %d", resp.StatusCode)
+	}
+
+	fmt.Println("Greeting result sent to server successfully")
+
+	// Log message yang dikirim
+	fmt.Printf("Sent message: %s\n", result.Message)
+	return nil
+}

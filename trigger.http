@@ -1,1 +1,12 @@
-POST http://localhost:8080/api/trigger-request?client_id=1742365441973638000&count=5
+@client_id=client-1742440249690285000
+
+###
+
+POST http://localhost:8080/api/trigger-request?client_id={{client_id}}&count=5
+
+###
+
+POST http://localhost:8080/api/greeting?client_id={{client_id}}&name=mirza
+
+###
+
